@@ -36,7 +36,11 @@ The npm package can be installed once published:
 npm install zcash-zip321-alpha
 ```
 
-For this alpha release, installation expects a working Rust toolchain because the native library is built during `npm install`.
+For this alpha release, installation tries the following in order:
+
+1. a packaged prebuilt native library for your platform
+2. a matching GitHub release asset for your package version
+3. a local Rust build fallback during `npm install`
 
 For local development:
 
@@ -48,6 +52,7 @@ npm run build:native
 The JavaScript bindings will look for the compiled native library in:
 
 - `ZCASH_ZIP321_LIB`
+- `prebuilds/<platform>-<arch>`
 - `target/debug`
 - `target/release`
 
@@ -184,8 +189,8 @@ Current methods:
 
 Notes:
 
-- proposal execution requires Sapling proving parameters
-- if `spendParamPath` and `outputParamPath` are omitted, the native layer looks in the default location used by `zcash-fetch-params`
+- proposal execution works out of the box because Sapling proving parameters are bundled into the native library
+- `spendParamPath` and `outputParamPath` are still accepted if you want to override the bundled prover inputs explicitly
 
 ### `new LightWalletClient(host, tls?)`
 
@@ -228,6 +233,7 @@ Current methods:
 5. Chain sync against `lightwalletd`
 6. Transaction enhancement, history inspection, and proposal creation
 7. Transaction construction, signing, and broadcast
+8. Broader prebuilt-binary coverage across platforms
 
 ## Project layout
 
@@ -235,11 +241,10 @@ Current methods:
 - [index.d.ts](/Users/semi/Vibecode/zlang/index.d.ts)
 - [src/lib.rs](/Users/semi/Vibecode/zlang/src/lib.rs)
 
-## Publish
+## Release assets
 
-1. Create a GitHub repo.
-2. Push this directory.
-3. Build and test the Rust library.
-4. Publish the npm package with `npm publish --access public`.
+This repo includes GitHub Actions workflows to:
 
-Before publishing, keep the `alpha` pre-release marker in the npm version until the API stabilizes.
+- test on Linux, macOS Intel, macOS Apple Silicon, and Windows
+- build native release binaries for those platforms on tagged releases
+- upload predictable release assets that the npm installer can download automatically

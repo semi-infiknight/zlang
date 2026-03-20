@@ -70,6 +70,7 @@ function resolveLibraryPath(explicitPath) {
     : `libzcash_zip321_alpha_native.${extension}`;
 
   candidates.push(
+    path.join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, libraryFile),
     path.join(__dirname, 'target', 'release', libraryFile),
     path.join(__dirname, 'target', 'debug', libraryFile)
   );

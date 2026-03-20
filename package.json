@@ -9,17 +9,22 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "scripts",
     "sdk",
+    "prebuilds",
     "Cargo.toml",
     "src",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "install": "cargo build --release",
+    "install": "node scripts/install.js",
     "build:native": "cargo build --release",
+    "stage:prebuilt": "node scripts/stage-prebuilt.js",
+    "prepare:release-asset": "node scripts/prepare-release-asset.js dist",
     "test": "node --test",
-    "prepublishOnly": "npm test && npm run build:native"
+    "prepack": "npm run build:native && npm run stage:prebuilt",
+    "prepublishOnly": "npm test && npm run build:native && npm run stage:prebuilt"
   },
   "repository": {
     "type": "git",

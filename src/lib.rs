@@ -693,9 +693,7 @@ fn make_local_tx_prover(
             reject_null_bytes(&output, "output_param_path")?;
             Ok(LocalTxProver::new(Path::new(&spend), Path::new(&output)))
         }
-        (None, None) => LocalTxProver::with_default_location().ok_or_else(|| {
-            "Sapling proving parameters were not found in the default location; set spend_param_path and output_param_path or install parameters with zcash-fetch-params".to_string()
-        }),
+        (None, None) => Ok(LocalTxProver::bundled()),
         _ => Err(
             "spend_param_path and output_param_path must either both be provided or both omitted"
                 .to_string(),
