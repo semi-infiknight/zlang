@@ -11,20 +11,21 @@ use secrecy::Secret;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zcash_address::{ConversionError, TryFromAddress, ZcashAddress};
+use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_backend::{
     data_api::{
         chain::{scan_cached_blocks, CommitmentTreeRoot},
         scanning::ScanPriority,
-        wallet::{propose_standard_transfer_to_address, ConfirmationsPolicy},
-        Account as _, AccountBirthday, BirthdayError, TransactionDataRequest,
-        WalletCommitmentTrees, WalletRead, WalletWrite,
+        wallet::{
+            create_proposed_transactions, decrypt_and_store_transaction,
+            propose_standard_transfer_to_address, ConfirmationsPolicy, SpendingKeys,
+        },
+        Account as _, AccountBirthday, AccountSource, BirthdayError, TransactionDataRequest,
+        TransactionStatus, WalletCommitmentTrees, WalletRead, WalletWrite,
     },
     encoding::AddressCodec,
     fees::StandardFeeRule,
-    proto::{
-        compact_formats::CompactBlock as ProtoCompactBlock, proposal as proposal_proto,
-        service::TreeState,
-    },
+    proto::{compact_formats::CompactBlock as ProtoCompactBlock, service::TreeState},
     wallet::WalletTransparentOutput,
 };
 use zcash_client_sqlite::{
@@ -33,12 +34,14 @@ use zcash_client_sqlite::{
     AccountUuid, WalletDb,
 };
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+use zcash_primitives::transaction::Transaction;
+use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
-    consensus::{BlockHeight, Network, NetworkType, Parameters},
+    consensus::{BlockHeight, BranchId, Network, NetworkType, Parameters},
     local_consensus::LocalNetwork,
     memo::MemoBytes,
     value::Zatoshis,
-    PoolType, ShieldedProtocol,
+    PoolType, ShieldedProtocol, TxId,
 };
 use zcash_transparent::{
     address::Script,
@@ -298,6 +301,86 @@ struct ProposalJson {
     min_target_height: u32,
     proposal_hex: String,
     steps: Vec<ProposalStepJson>,
+}
+
+#[derive(Deserialize)]
+struct WalletDecryptAndStoreTransactionInput {
+    db_path: String,
+    network: String,
+    tx_hex: String,
+    mined_height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WalletSetTransactionStatusInput {
+    db_path: String,
+    network: String,
+    txid_hex: String,
+    status: String,
+    mined_height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WalletGetTransactionsInput {
+    db_path: String,
+    network: String,
+    account_uuid: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct TransactionOverviewJson {
+    txid_hex: String,
+    mined_height: Option<i64>,
+    block_time: Option<i64>,
+    account_balance_delta: i64,
+    fee: Option<i64>,
+    memo_count: i64,
+    account_uuid: String,
+    is_shielding: bool,
+    expired_unmined: bool,
+}
+
+#[derive(Deserialize)]
+struct WalletGetTransactionOutputsInput {
+    db_path: String,
+    network: String,
+    txid_hex: String,
+}
+
+#[derive(Serialize)]
+struct TransactionOutputJson {
+    pool: String,
+    output_index: i64,
+    memo_hex: Option<String>,
+    address: Option<String>,
+    value: i64,
+    is_change: bool,
+}
+
+#[derive(Deserialize)]
+struct WalletCreateProposedTransactionsInput {
+    db_path: String,
+    network: String,
+    account_uuid: String,
+    proposal_hex: String,
+    seed_hex: String,
+    ovk_policy: Option<String>,
+    spend_param_path: Option<String>,
+    output_param_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreatedTransactionJson {
+    txid_hex: String,
+    raw_tx_hex: String,
+}
+
+#[derive(Serialize)]
+struct CreatedTransactionsJson {
+    txids: Vec<String>,
+    transactions: Vec<CreatedTransactionJson>,
 }
 
 struct ParsedAddress(ParsedAddressJson);
@@ -561,6 +644,62 @@ fn parse_change_pool(value: Option<String>) -> Result<ShieldedProtocol, String> 
         other => Err(format!(
             "unsupported fallback_change_pool: {other}; expected one of: orchard, sapling"
         )),
+    }
+}
+
+fn parse_transaction_status(
+    status: &str,
+    mined_height: Option<u32>,
+) -> Result<TransactionStatus, String> {
+    match status {
+        "txid_not_recognized" => Ok(TransactionStatus::TxidNotRecognized),
+        "not_in_main_chain" => Ok(TransactionStatus::NotInMainChain),
+        "mined" => mined_height
+            .map(BlockHeight::from_u32)
+            .map(TransactionStatus::Mined)
+            .ok_or_else(|| "mined_height is required when status is 'mined'".to_string()),
+        other => Err(format!(
+            "unsupported status: {other}; expected one of: txid_not_recognized, not_in_main_chain, mined"
+        )),
+    }
+}
+
+fn output_pool_name(code: i64) -> &'static str {
+    match code {
+        0 => "transparent",
+        2 => "sapling",
+        3 => "orchard",
+        _ => "unknown",
+    }
+}
+
+fn parse_ovk_policy(value: Option<String>) -> Result<OvkPolicy, String> {
+    match value.as_deref().unwrap_or("sender") {
+        "sender" => Ok(OvkPolicy::Sender),
+        "discard" => Ok(OvkPolicy::Discard),
+        other => Err(format!(
+            "unsupported ovk_policy: {other}; expected one of: sender, discard"
+        )),
+    }
+}
+
+fn make_local_tx_prover(
+    spend_param_path: Option<String>,
+    output_param_path: Option<String>,
+) -> Result<LocalTxProver, String> {
+    match (spend_param_path, output_param_path) {
+        (Some(spend), Some(output)) => {
+            reject_null_bytes(&spend, "spend_param_path")?;
+            reject_null_bytes(&output, "output_param_path")?;
+            Ok(LocalTxProver::new(Path::new(&spend), Path::new(&output)))
+        }
+        (None, None) => LocalTxProver::with_default_location().ok_or_else(|| {
+            "Sapling proving parameters were not found in the default location; set spend_param_path and output_param_path or install parameters with zcash-fetch-params".to_string()
+        }),
+        _ => Err(
+            "spend_param_path and output_param_path must either both be provided or both omitted"
+                .to_string(),
+        ),
     }
 }
 
@@ -1281,7 +1420,8 @@ fn wallet_propose_transfer(input_json: &str) -> Result<String, String> {
     .map_err(|err| format!("Error creating transfer proposal: {err}"))?;
 
     let proposal_bytes =
-        proposal_proto::Proposal::from_standard_proposal(&proposal).encode_to_vec();
+        zcash_client_backend::proto::proposal::Proposal::from_standard_proposal(&proposal)
+            .encode_to_vec();
     let steps = proposal
         .steps()
         .iter()
@@ -1317,6 +1457,268 @@ fn wallet_propose_transfer(input_json: &str) -> Result<String, String> {
         min_target_height: u32::from(proposal.min_target_height()),
         proposal_hex: hex::encode(proposal_bytes),
         steps,
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn wallet_decrypt_and_store_transaction(input_json: &str) -> Result<String, String> {
+    let input: WalletDecryptAndStoreTransactionInput =
+        serde_json::from_str(input_json).map_err(|err| format!("invalid JSON input: {err}"))?;
+    reject_null_bytes(&input.db_path, "db_path")?;
+    reject_null_bytes(&input.tx_hex, "tx_hex")?;
+
+    let network = parse_wallet_network(&input.network)?;
+    let tx_bytes =
+        hex::decode(&input.tx_hex).map_err(|err| format!("tx_hex was not valid hex: {err}"))?;
+    let parse_height = BlockHeight::from_u32(input.mined_height.unwrap_or(1));
+    let branch_id = BranchId::for_height(&network, parse_height);
+    let tx = Transaction::read(std::io::Cursor::new(tx_bytes), branch_id)
+        .map_err(|err| format!("transaction decode failed: {err}"))?;
+
+    let mut db = open_wallet_db(&input.db_path, network)?;
+    decrypt_and_store_transaction(
+        &network,
+        &mut db,
+        &tx,
+        input.mined_height.map(BlockHeight::from_u32),
+    )
+    .map_err(|err| format!("Error storing decrypted transaction: {err}"))?;
+
+    serde_json::to_string(&StatusOnlyOutput { status: "ok" }).map_err(|err| err.to_string())
+}
+
+fn wallet_set_transaction_status(input_json: &str) -> Result<String, String> {
+    let input: WalletSetTransactionStatusInput =
+        serde_json::from_str(input_json).map_err(|err| format!("invalid JSON input: {err}"))?;
+    reject_null_bytes(&input.db_path, "db_path")?;
+    reject_null_bytes(&input.txid_hex, "txid_hex")?;
+
+    let network = parse_wallet_network(&input.network)?;
+    let txid_bytes =
+        hex::decode(&input.txid_hex).map_err(|err| format!("txid_hex was not valid hex: {err}"))?;
+    let txid_bytes: [u8; 32] = txid_bytes
+        .try_into()
+        .map_err(|_| "txid_hex must decode to 32 bytes".to_string())?;
+    let status = parse_transaction_status(&input.status, input.mined_height)?;
+
+    let mut db = open_wallet_db(&input.db_path, network)?;
+    db.set_transaction_status(TxId::from_bytes(txid_bytes), status)
+        .map_err(|err| format!("Error setting transaction status: {err}"))?;
+
+    serde_json::to_string(&StatusOnlyOutput { status: "ok" }).map_err(|err| err.to_string())
+}
+
+fn wallet_get_transactions(input_json: &str) -> Result<String, String> {
+    let input: WalletGetTransactionsInput =
+        serde_json::from_str(input_json).map_err(|err| format!("invalid JSON input: {err}"))?;
+    reject_null_bytes(&input.db_path, "db_path")?;
+
+    let network = parse_wallet_network(&input.network)?;
+    let account_uuid = parse_account_uuid(&input.account_uuid)?;
+    let offset = i64::from(input.offset.unwrap_or(0));
+    let limit = i64::from(input.limit.unwrap_or(50));
+    let uuid_bytes = account_uuid.expose_uuid().as_bytes().to_vec();
+    let _db = open_wallet_db(&input.db_path, network)?;
+    let conn = rusqlite::Connection::open(&input.db_path)
+        .map_err(|err| format!("Error opening wallet database: {err}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT txid, mined_height, block_time, account_balance_delta,
+                    fee_paid, memo_count, is_shielding, expired_unmined, account_uuid
+             FROM v_transactions
+             WHERE account_uuid = ?1
+             ORDER BY mined_height IS NOT NULL, mined_height DESC, txid
+             LIMIT ?2 OFFSET ?3",
+        )
+        .map_err(|err| format!("Error preparing transaction query: {err}"))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![uuid_bytes, limit, offset], |row| {
+            let txid: Vec<u8> = row.get(0)?;
+            let mined_height: Option<i64> = row.get(1)?;
+            let block_time: Option<i64> = row.get(2)?;
+            let account_balance_delta: i64 = row.get(3)?;
+            let fee: Option<i64> = row.get(4)?;
+            let memo_count: i64 = row.get(5)?;
+            let is_shielding: bool = row.get(6)?;
+            let expired_unmined: bool = row.get(7)?;
+            let account_uuid: Vec<u8> = row.get(8)?;
+
+            Ok(TransactionOverviewJson {
+                txid_hex: hex::encode(txid),
+                mined_height,
+                block_time,
+                account_balance_delta,
+                fee,
+                memo_count,
+                account_uuid: Uuid::from_slice(&account_uuid)
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| hex::encode(account_uuid)),
+                is_shielding,
+                expired_unmined,
+            })
+        })
+        .map_err(|err| format!("Error querying transactions: {err}"))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|err| format!("Error reading transaction row: {err}"))?);
+    }
+
+    serde_json::to_string(&results).map_err(|err| err.to_string())
+}
+
+fn wallet_get_transaction_outputs(input_json: &str) -> Result<String, String> {
+    let input: WalletGetTransactionOutputsInput =
+        serde_json::from_str(input_json).map_err(|err| format!("invalid JSON input: {err}"))?;
+    reject_null_bytes(&input.db_path, "db_path")?;
+    reject_null_bytes(&input.txid_hex, "txid_hex")?;
+
+    let network = parse_wallet_network(&input.network)?;
+    let txid_bytes =
+        hex::decode(&input.txid_hex).map_err(|err| format!("txid_hex was not valid hex: {err}"))?;
+    let txid_bytes: [u8; 32] = txid_bytes
+        .try_into()
+        .map_err(|_| "txid_hex must decode to 32 bytes".to_string())?;
+    let _db = open_wallet_db(&input.db_path, network)?;
+    let conn = rusqlite::Connection::open(&input.db_path)
+        .map_err(|err| format!("Error opening wallet database: {err}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT output_pool, output_index, memo, to_address, value, is_change
+             FROM v_tx_outputs
+             WHERE txid = ?1
+             ORDER BY output_pool, output_index",
+        )
+        .map_err(|err| format!("Error preparing transaction output query: {err}"))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![&txid_bytes[..]], |row| {
+            let output_pool: i64 = row.get(0)?;
+            let output_index: i64 = row.get(1)?;
+            let memo_bytes: Option<Vec<u8>> = row.get(2)?;
+            let address: Option<String> = row.get(3)?;
+            let value: i64 = row.get(4)?;
+            let is_change: bool = row.get(5)?;
+
+            let memo_hex = memo_bytes.and_then(|bytes| {
+                if bytes.is_empty()
+                    || (bytes[0] == 0xF6 && bytes[1..].iter().all(|&byte| byte == 0))
+                {
+                    None
+                } else {
+                    Some(hex::encode(bytes))
+                }
+            });
+
+            Ok(TransactionOutputJson {
+                pool: output_pool_name(output_pool).to_string(),
+                output_index,
+                memo_hex,
+                address,
+                value,
+                is_change,
+            })
+        })
+        .map_err(|err| format!("Error querying transaction outputs: {err}"))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|err| format!("Error reading transaction output row: {err}"))?);
+    }
+
+    serde_json::to_string(&results).map_err(|err| err.to_string())
+}
+
+fn wallet_create_proposed_transactions(input_json: &str) -> Result<String, String> {
+    let input: WalletCreateProposedTransactionsInput =
+        serde_json::from_str(input_json).map_err(|err| format!("invalid JSON input: {err}"))?;
+    reject_null_bytes(&input.db_path, "db_path")?;
+    reject_null_bytes(&input.account_uuid, "account_uuid")?;
+    reject_null_bytes(&input.proposal_hex, "proposal_hex")?;
+    reject_null_bytes(&input.seed_hex, "seed_hex")?;
+
+    let network = parse_wallet_network(&input.network)?;
+    let account_uuid = parse_account_uuid(&input.account_uuid)?;
+    let proposal_bytes = hex::decode(&input.proposal_hex)
+        .map_err(|err| format!("proposal_hex was not valid hex: {err}"))?;
+    let proposal_proto =
+        zcash_client_backend::proto::proposal::Proposal::decode(proposal_bytes.as_slice())
+            .map_err(|err| format!("proposal_hex was not valid proposal protobuf: {err}"))?;
+    let seed =
+        hex::decode(&input.seed_hex).map_err(|err| format!("seed_hex was not valid hex: {err}"))?;
+    if seed.len() < 32 {
+        return Err("seed_hex must decode to at least 32 bytes".to_string());
+    }
+    let ovk_policy = parse_ovk_policy(input.ovk_policy)?;
+
+    let mut db = open_wallet_db(&input.db_path, network)?;
+    let account = db
+        .get_account(account_uuid)
+        .map_err(|err| format!("Error getting account: {err}"))?
+        .ok_or_else(|| format!("Account {} not found", account_uuid.expose_uuid()))?;
+    let account_index = match account.source() {
+        AccountSource::Derived { derivation, .. } => derivation.account_index(),
+        AccountSource::Imported { purpose, .. } => match purpose {
+            zcash_client_backend::data_api::AccountPurpose::Spending {
+                derivation: Some(derivation),
+            } => derivation.account_index(),
+            _ => {
+                return Err(
+                    "account does not expose ZIP-32 derivation metadata required for spending"
+                        .to_string(),
+                )
+            }
+        },
+    };
+    let usk = UnifiedSpendingKey::from_seed(&network, &seed, account_index)
+        .map_err(|err| format!("Error deriving unified spending key: {err}"))?;
+    let spending_keys = SpendingKeys::from_unified_spending_key(usk);
+    let proposal = proposal_proto
+        .try_into_standard_proposal(&db)
+        .map_err(|err| format!("Error decoding transfer proposal: {err}"))?;
+    let prover = make_local_tx_prover(input.spend_param_path, input.output_param_path)?;
+    let txids = create_proposed_transactions::<
+        _,
+        _,
+        std::convert::Infallible,
+        _,
+        std::convert::Infallible,
+        _,
+    >(
+        &mut db,
+        &network,
+        &prover,
+        &prover,
+        &spending_keys,
+        ovk_policy,
+        &proposal,
+    )
+    .map_err(|err| format!("Error creating proposed transactions: {err}"))?;
+
+    let mut txid_strings = Vec::new();
+    let mut transactions = Vec::new();
+    for txid in txids {
+        let tx = db
+            .get_transaction(txid)
+            .map_err(|err| format!("Error fetching created transaction: {err}"))?
+            .ok_or_else(|| format!("Created transaction {} not found in wallet DB", txid))?;
+        let mut raw_tx = Vec::new();
+        tx.write(&mut raw_tx)
+            .map_err(|err| format!("Error serializing created transaction: {err}"))?;
+        let txid_hex = txid.to_string();
+        txid_strings.push(txid_hex.clone());
+        transactions.push(CreatedTransactionJson {
+            txid_hex,
+            raw_tx_hex: hex::encode(raw_tx),
+        });
+    }
+
+    serde_json::to_string(&CreatedTransactionsJson {
+        txids: txid_strings,
+        transactions,
     })
     .map_err(|err| err.to_string())
 }
@@ -1821,6 +2223,115 @@ pub extern "C" fn zcash_wallet_propose_transfer(input_json: *const c_char) -> *m
     };
 
     match wallet_propose_transfer(&input_json) {
+        Ok(payload) => into_c_string(payload),
+        Err(err) => {
+            set_last_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn zcash_wallet_decrypt_and_store_transaction(
+    input_json: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+
+    let input_json = match parse_input(input_json, "input_json") {
+        Ok(value) => value,
+        Err(err) => {
+            set_last_error(err);
+            return ptr::null_mut();
+        }
+    };
+
+    match wallet_decrypt_and_store_transaction(&input_json) {
+        Ok(payload) => into_c_string(payload),
+        Err(err) => {
+            set_last_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn zcash_wallet_set_transaction_status(input_json: *const c_char) -> *mut c_char {
+    clear_last_error();
+
+    let input_json = match parse_input(input_json, "input_json") {
+        Ok(value) => value,
+        Err(err) => {
+            set_last_error(err);
+            return ptr::null_mut();
+        }
+    };
+
+    match wallet_set_transaction_status(&input_json) {
+        Ok(payload) => into_c_string(payload),
+        Err(err) => {
+            set_last_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn zcash_wallet_get_transactions(input_json: *const c_char) -> *mut c_char {
+    clear_last_error();
+
+    let input_json = match parse_input(input_json, "input_json") {
+        Ok(value) => value,
+        Err(err) => {
+            set_last_error(err);
+            return ptr::null_mut();
+        }
+    };
+
+    match wallet_get_transactions(&input_json) {
+        Ok(payload) => into_c_string(payload),
+        Err(err) => {
+            set_last_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn zcash_wallet_get_transaction_outputs(input_json: *const c_char) -> *mut c_char {
+    clear_last_error();
+
+    let input_json = match parse_input(input_json, "input_json") {
+        Ok(value) => value,
+        Err(err) => {
+            set_last_error(err);
+            return ptr::null_mut();
+        }
+    };
+
+    match wallet_get_transaction_outputs(&input_json) {
+        Ok(payload) => into_c_string(payload),
+        Err(err) => {
+            set_last_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn zcash_wallet_create_proposed_transactions(
+    input_json: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+
+    let input_json = match parse_input(input_json, "input_json") {
+        Ok(value) => value,
+        Err(err) => {
+            set_last_error(err);
+            return ptr::null_mut();
+        }
+    };
+
+    match wallet_create_proposed_transactions(&input_json) {
         Ok(payload) => into_c_string(payload),
         Err(err) => {
             set_last_error(err);

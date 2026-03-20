@@ -28,6 +28,22 @@ function rejectNullBytes(value, paramName) {
   }
 }
 
+function normalizeSendResponse(response, txidHex) {
+  const errorCode = Number(response?.errorCode ?? 0);
+  const errorMessage = response?.errorMessage || '';
+
+  if (errorCode !== 0) {
+    throw new WalletError(
+      `lightwalletd rejected transaction ${txidHex}: [${errorCode}] ${errorMessage}`
+    );
+  }
+
+  return {
+    errorCode,
+    errorMessage
+  };
+}
+
 function resolveLibraryPath(explicitPath) {
   if (explicitPath) {
     if (fs.existsSync(explicitPath)) {
@@ -105,6 +121,11 @@ function createNativeBindings(explicitPath) {
     walletGetAllTransparentAddresses: lib.func('RustString zcash_wallet_get_all_transparent_addresses(const char *input_json)'),
     walletPutUtxo: lib.func('RustString zcash_wallet_put_utxo(const char *input_json)'),
     walletProposeTransfer: lib.func('RustString zcash_wallet_propose_transfer(const char *input_json)'),
+    walletDecryptAndStoreTransaction: lib.func('RustString zcash_wallet_decrypt_and_store_transaction(const char *input_json)'),
+    walletSetTransactionStatus: lib.func('RustString zcash_wallet_set_transaction_status(const char *input_json)'),
+    walletGetTransactions: lib.func('RustString zcash_wallet_get_transactions(const char *input_json)'),
+    walletGetTransactionOutputs: lib.func('RustString zcash_wallet_get_transaction_outputs(const char *input_json)'),
+    walletCreateProposedTransactions: lib.func('RustString zcash_wallet_create_proposed_transactions(const char *input_json)'),
     lastError: lib.func('RustString zcash_zip321_last_error(void)')
   };
 
@@ -418,6 +439,149 @@ class ZcashWallet {
       change_memo: changeMemo,
       fallback_change_pool: fallbackChangePool
     });
+  }
+
+  decryptAndStoreTransaction({ txHex, minedHeight }) {
+    return this._walletJsonCall('walletDecryptAndStoreTransaction', {
+      db_path: this.dbPath,
+      network: this.network,
+      tx_hex: txHex,
+      mined_height: minedHeight
+    });
+  }
+
+  setTransactionStatus({ txidHex, status, minedHeight }) {
+    return this._walletJsonCall('walletSetTransactionStatus', {
+      db_path: this.dbPath,
+      network: this.network,
+      txid_hex: txidHex,
+      status,
+      mined_height: minedHeight
+    });
+  }
+
+  getTransactions(accountUuid, options = {}) {
+    rejectNullBytes(accountUuid, 'accountUuid');
+    return this._walletJsonCall('walletGetTransactions', {
+      db_path: this.dbPath,
+      network: this.network,
+      account_uuid: accountUuid,
+      offset: options.offset,
+      limit: options.limit
+    });
+  }
+
+  getTransactionOutputs(txidHex) {
+    rejectNullBytes(txidHex, 'txidHex');
+    return this._walletJsonCall('walletGetTransactionOutputs', {
+      db_path: this.dbPath,
+      network: this.network,
+      txid_hex: txidHex
+    });
+  }
+
+  createProposedTransactions({
+    accountUuid,
+    proposalHex,
+    seedHex,
+    ovkPolicy,
+    spendParamPath,
+    outputParamPath
+  }) {
+    rejectNullBytes(accountUuid, 'accountUuid');
+    rejectNullBytes(proposalHex, 'proposalHex');
+    rejectNullBytes(seedHex, 'seedHex');
+    rejectNullBytes(spendParamPath, 'spendParamPath');
+    rejectNullBytes(outputParamPath, 'outputParamPath');
+    return this._walletJsonCall('walletCreateProposedTransactions', {
+      db_path: this.dbPath,
+      network: this.network,
+      account_uuid: accountUuid,
+      proposal_hex: proposalHex,
+      seed_hex: seedHex,
+      ovk_policy: ovkPolicy,
+      spend_param_path: spendParamPath,
+      output_param_path: outputParamPath
+    });
+  }
+
+  async sendProposedTransactions({
+    accountUuid,
+    proposalHex,
+    seedHex,
+    client,
+    ovkPolicy,
+    spendParamPath,
+    outputParamPath,
+    height = 0
+  }) {
+    const created = this.createProposedTransactions({
+      accountUuid,
+      proposalHex,
+      seedHex,
+      ovkPolicy,
+      spendParamPath,
+      outputParamPath
+    });
+
+    const results = [];
+    for (const tx of created.transactions) {
+      const response = normalizeSendResponse(
+        await client.sendTransaction(Buffer.from(tx.raw_tx_hex, 'hex'), height),
+        tx.txid_hex
+      );
+      results.push({
+        txidHex: tx.txid_hex,
+        rawTxHex: tx.raw_tx_hex,
+        response
+      });
+    }
+
+    return {
+      txids: created.txids,
+      results
+    };
+  }
+
+  async sendTransfer({
+    accountUuid,
+    toAddress,
+    value,
+    memo,
+    changeMemo,
+    fallbackChangePool,
+    seedHex,
+    client,
+    ovkPolicy,
+    spendParamPath,
+    outputParamPath,
+    height = 0
+  }) {
+    const proposal = this.proposeTransfer({
+      accountUuid,
+      toAddress,
+      value,
+      memo,
+      changeMemo,
+      fallbackChangePool
+    });
+
+    const sent = await this.sendProposedTransactions({
+      accountUuid,
+      proposalHex: proposal.proposal_hex,
+      seedHex,
+      client,
+      ovkPolicy,
+      spendParamPath,
+      outputParamPath,
+      height
+    });
+
+    return {
+      proposal,
+      txids: sent.txids,
+      results: sent.results
+    };
   }
 
   _walletStringCall(methodName, accountUuid) {

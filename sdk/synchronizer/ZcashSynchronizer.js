@@ -42,6 +42,86 @@ class ZcashSynchronizer {
     return { tipHeight };
   }
 
+  async enhanceTransactions() {
+    const requests = this.wallet.transactionDataRequests();
+
+    for (const request of requests) {
+      if ((request.request_type === 0 || request.request_type === 1) && request.txid_hex) {
+        let raw;
+        try {
+          raw = await this.client.getTransaction(Buffer.from(request.txid_hex, 'hex'));
+        } catch (error) {
+          if (request.request_type === 0 && isMissingTransactionError(error)) {
+            this.wallet.setTransactionStatus({
+              txidHex: request.txid_hex,
+              status: 'txid_not_recognized'
+            });
+            continue;
+          }
+
+          throw error;
+        }
+        if (request.request_type === 0) {
+          this.wallet.setTransactionStatus({
+            txidHex: request.txid_hex,
+            ...transactionStatusFromRaw(raw)
+          });
+          continue;
+        }
+
+        if (raw?.data?.length > 0) {
+          this.wallet.decryptAndStoreTransaction({
+            txHex: Buffer.from(raw.data).toString('hex'),
+            minedHeight: normalizeMinedHeight(raw.height)
+          });
+        }
+        continue;
+      }
+
+      if (request.request_type === 2 && request.address && request.block_range_start != null) {
+        const startHeight = request.block_range_start;
+        const endExclusive = request.block_range_end ?? (startHeight + 1);
+        const endInclusive = Math.max(startHeight, endExclusive - 1);
+
+        for await (const raw of this.client.getTaddressTransactions(
+          request.address,
+          startHeight,
+          endInclusive
+        )) {
+          if (raw?.data?.length > 0) {
+            this.wallet.decryptAndStoreTransaction({
+              txHex: Buffer.from(raw.data).toString('hex'),
+              minedHeight: normalizeMinedHeight(raw.height)
+            });
+          }
+        }
+
+        const utxos = await this.client.getAddressUtxos([request.address], startHeight, 0);
+        for (const utxo of utxos.addressUtxos || []) {
+          this.wallet.putUtxo({
+            txidHex: Buffer.from(utxo.txid).toString('hex'),
+            index: utxo.index,
+            scriptHex: Buffer.from(utxo.script).toString('hex'),
+            value: Number(utxo.valueZat),
+            height: Number(utxo.height)
+          });
+        }
+      }
+    }
+
+    return { requestCount: requests.length };
+  }
+
+  async syncAndEnhance() {
+    const sync = await this.syncOnce();
+    const enhancement = await this.enhanceTransactions();
+
+    return {
+      tipHeight: sync.tipHeight,
+      requestCount: enhancement.requestCount
+    };
+  }
+
   async _syncSubtreeRoots() {
     const saplingRoots = [];
     for await (const root of this.client.getSubtreeRoots(0, 0, 0)) {
@@ -98,6 +178,32 @@ class ZcashSynchronizer {
       cursor = end;
     }
   }
+}
+
+function normalizeMinedHeight(height) {
+  const normalized = Number(height);
+  if (!Number.isFinite(normalized) || normalized <= 0 || normalized >= Number.MAX_SAFE_INTEGER) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function transactionStatusFromRaw(raw) {
+  const minedHeight = normalizeMinedHeight(raw?.height);
+  if (minedHeight != null) {
+    return { status: 'mined', minedHeight };
+  }
+
+  return { status: 'not_in_main_chain' };
+}
+
+function isMissingTransactionError(error) {
+  return error && (
+    error.code === 5 ||
+    error.details === 'txid not recognized' ||
+    /not found|not recognized/i.test(String(error.message || error.details || ''))
+  );
 }
 
 module.exports = {

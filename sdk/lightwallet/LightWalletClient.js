@@ -46,12 +46,40 @@ class LightWalletClient {
     return this._unary('GetLatestBlock', {});
   }
 
+  getBlock(height) {
+    return this._unary('GetBlock', { height });
+  }
+
+  getTransaction(txid) {
+    return this._unary('GetTransaction', { hash: txid });
+  }
+
+  sendTransaction(data, height = 0) {
+    return this._unary('SendTransaction', { data, height });
+  }
+
   getTreeState(height) {
     return this._unary('GetTreeState', { height });
   }
 
+  getLatestTreeState() {
+    return this._unary('GetLatestTreeState', {});
+  }
+
   getLightdInfo() {
     return this._unary('GetLightdInfo', {});
+  }
+
+  getTaddressBalance(addresses) {
+    return this._unary('GetTaddressBalance', { addresses });
+  }
+
+  getAddressUtxos(addresses, startHeight, maxEntries = 0) {
+    return this._unary('GetAddressUtxos', {
+      addresses,
+      startHeight,
+      maxEntries
+    });
   }
 
   async *getBlockRange(startHeight, endHeight) {
@@ -67,6 +95,34 @@ class LightWalletClient {
       shieldedProtocol: protocol,
       maxEntries
     });
+  }
+
+  async *getTaddressTransactions(address, startHeight, endHeight) {
+    yield* this._serverStream('GetTaddressTransactions', {
+      address,
+      range: {
+        start: { height: startHeight },
+        end: { height: endHeight }
+      }
+    });
+  }
+
+  async *getAddressUtxosStream(addresses, startHeight, maxEntries = 0) {
+    yield* this._serverStream('GetAddressUtxosStream', {
+      addresses,
+      startHeight,
+      maxEntries
+    });
+  }
+
+  async *getMempoolTx(excludeTxidSuffixes = []) {
+    yield* this._serverStream('GetMempoolTx', {
+      exclude_txid_suffixes: excludeTxidSuffixes
+    });
+  }
+
+  async *getMempoolStream() {
+    yield* this._serverStream('GetMempoolStream', {});
   }
 
   _unary(method, request) {

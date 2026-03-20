@@ -1,6 +1,6 @@
 # zcash-zip321-alpha
 
-Alpha JavaScript bindings for useful slices of `librustzcash`: wallet DB/account setup, basic sync plumbing, wallet summary/balances, transaction enhancement inputs, transparent UTXO staging, transfer proposal creation, key derivation, unified address generation, address parsing, and ZIP-321 payment URI parsing.
+Alpha JavaScript bindings for useful slices of `librustzcash`: wallet DB/account setup, basic sync plumbing, wallet summary/balances, transaction enhancement inputs, transaction history inspection, transparent UTXO staging, transfer proposal creation, key derivation, unified address generation, address parsing, and ZIP-321 payment URI parsing.
 
 This package wraps a tiny Rust native library over FFI and exposes a Node API that returns structured data for:
 
@@ -9,8 +9,10 @@ This package wraps a tiny Rust native library over FFI and exposes a Node API th
 - talking to `lightwalletd` and driving a basic one-shot sync loop
 - querying wallet summary and latest scanned height
 - listing pending transaction data requests and transparent receiver addresses
+- marking transaction status and reading transaction history/output details
 - staging transparent UTXOs discovered outside compact block scanning
 - creating ZIP-317 transfer proposals from synced wallet state
+- creating, proving, signing, and extracting raw transactions from stored proposals
 - deriving seed fingerprints and unified full viewing keys
 - deriving unified addresses from a seed
 - validating and classifying Zcash addresses
@@ -172,6 +174,18 @@ Current methods:
 - `getAllTransparentAddresses()`
 - `putUtxo({ txidHex, index, scriptHex, value, height })`
 - `proposeTransfer({ accountUuid, toAddress, value, memo?, changeMemo?, fallbackChangePool? })`
+- `decryptAndStoreTransaction({ txHex, minedHeight? })`
+- `setTransactionStatus({ txidHex, status, minedHeight? })`
+- `getTransactions(accountUuid, { offset?, limit? })`
+- `getTransactionOutputs(txidHex)`
+- `createProposedTransactions({ accountUuid, proposalHex, seedHex, ovkPolicy?, spendParamPath?, outputParamPath? })`
+- `sendProposedTransactions({ accountUuid, proposalHex, seedHex, client, ovkPolicy?, spendParamPath?, outputParamPath?, height? })`
+- `sendTransfer({ accountUuid, toAddress, value, memo?, changeMemo?, fallbackChangePool?, seedHex, client, ovkPolicy?, spendParamPath?, outputParamPath?, height? })`
+
+Notes:
+
+- proposal execution requires Sapling proving parameters
+- if `spendParamPath` and `outputParamPath` are omitted, the native layer looks in the default location used by `zcash-fetch-params`
 
 ### `new LightWalletClient(host, tls?)`
 
@@ -179,11 +193,21 @@ Minimal gRPC client for `lightwalletd`.
 
 Current methods:
 
+- `getBlock(height)`
+- `getTransaction(txid)`
+- `sendTransaction(data, height?)`
 - `getLatestBlock()`
+- `getLatestTreeState()`
 - `getTreeState(height)`
 - `getLightdInfo()`
+- `getTaddressBalance(addresses)`
+- `getAddressUtxos(addresses, startHeight, maxEntries?)`
 - `getBlockRange(startHeight, endHeight)`
 - `getSubtreeRoots(protocol, startIndex?, maxEntries?)`
+- `getTaddressTransactions(address, startHeight, endHeight)`
+- `getAddressUtxosStream(addresses, startHeight, maxEntries?)`
+- `getMempoolTx(excludeTxidSuffixes?)`
+- `getMempoolStream()`
 
 ### `new ZcashSynchronizer(wallet, client, options?)`
 
@@ -192,6 +216,8 @@ Minimal sync engine.
 Current methods:
 
 - `syncOnce()`
+- `enhanceTransactions()`
+- `syncAndEnhance()`
 
 ## Current roadmap
 
@@ -200,8 +226,8 @@ Current methods:
 3. Unified address generation
 4. Wallet initialization and key derivation
 5. Chain sync against `lightwalletd`
-6. Transaction enhancement and proposal creation
-7. Transaction construction, signing, and send
+6. Transaction enhancement, history inspection, and proposal creation
+7. Transaction construction, signing, and broadcast
 
 ## Project layout
 
