@@ -5,10 +5,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 
 const {
+  deriveUnifiedFullViewingKey,
   generateUnifiedAddress,
   parseAddress,
   parseZip321,
-  resolveLibraryPath
+  resolveLibraryPath,
+  seedFingerprint
 } = require('../index.js');
 
 function hasNativePrereqs() {
@@ -55,4 +57,22 @@ test('native generateUnifiedAddress works end to end', { skip: !hasNativePrereqs
   assert.equal(generated.diversifierIndexHex.length, 22);
   assert.ok(generated.receiverTypes.includes('orchard'));
   assert.ok(generated.receiverTypes.length >= 1);
+});
+
+test('native seedFingerprint works end to end', { skip: !hasNativePrereqs() }, () => {
+  const fingerprint = seedFingerprint('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f');
+  assert.equal(
+    fingerprint,
+    'zip32seedfp1mmlkqnpyvug0w9mdatgz4f6x7t7c65uf7urj24kuk42lm0j78t3sne2h0z'
+  );
+});
+
+test('native deriveUnifiedFullViewingKey works end to end', { skip: !hasNativePrereqs() }, () => {
+  const ufvk = deriveUnifiedFullViewingKey({
+    seedHex: '00'.repeat(32),
+    network: 'testnet',
+    account: 0
+  });
+
+  assert.match(ufvk, /^uviewtest/);
 });

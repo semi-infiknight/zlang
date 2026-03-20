@@ -1,7 +1,7 @@
 {
   "name": "zcash-zip321-alpha",
   "version": "0.1.0-alpha.0",
-  "description": "Alpha JavaScript bindings for Zcash ZIP-321 parsing via Rust FFI.",
+  "description": "Alpha JavaScript bindings for Zcash wallet primitives, sync, and ZIP-321 parsing via Rust FFI.",
   "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
@@ -9,6 +9,7 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "sdk",
     "Cargo.toml",
     "src",
     "README.md",
@@ -38,6 +39,9 @@
     "access": "public"
   },
   "dependencies": {
-    "koffi": "^2.11.0"
+    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/proto-loader": "^0.8.0",
+    "koffi": "^2.11.0",
+    "protobufjs": "^7.5.4"
   }
 }

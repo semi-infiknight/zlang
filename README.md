@@ -1,9 +1,17 @@
 # zcash-zip321-alpha
 
-Alpha JavaScript bindings for useful slices of `librustzcash`: unified address generation, address parsing, and ZIP-321 payment URI parsing.
+Alpha JavaScript bindings for useful slices of `librustzcash`: wallet DB/account setup, basic sync plumbing, wallet summary/balances, transaction enhancement inputs, transparent UTXO staging, transfer proposal creation, key derivation, unified address generation, address parsing, and ZIP-321 payment URI parsing.
 
 This package wraps a tiny Rust native library over FFI and exposes a Node API that returns structured data for:
 
+- initializing a wallet database and creating accounts
+- querying current/next/sapling/orchard/transparent addresses for an account
+- talking to `lightwalletd` and driving a basic one-shot sync loop
+- querying wallet summary and latest scanned height
+- listing pending transaction data requests and transparent receiver addresses
+- staging transparent UTXOs discovered outside compact block scanning
+- creating ZIP-317 transfer proposals from synced wallet state
+- deriving seed fingerprints and unified full viewing keys
 - deriving unified addresses from a seed
 - validating and classifying Zcash addresses
 - parsing `zcash:` payment request URIs
@@ -45,9 +53,14 @@ The JavaScript bindings will look for the compiled native library in:
 
 ```js
 const {
+  LightWalletClient,
+  ZcashSynchronizer,
+  ZcashWallet,
+  deriveUnifiedFullViewingKey,
   generateUnifiedAddress,
   parseAddress,
-  parseZip321
+  parseZip321,
+  seedFingerprint
 } = require('zcash-zip321-alpha');
 
 const request = parseZip321(
@@ -70,6 +83,25 @@ const generated = generateUnifiedAddress({
 
 console.log(generated.address);
 console.log(generated.ufvk);
+console.log(seedFingerprint('00'.repeat(32)));
+console.log(
+  deriveUnifiedFullViewingKey({
+    seedHex: '00'.repeat(32),
+    network: 'testnet',
+    account: 0
+  })
+);
+
+const wallet = new ZcashWallet({
+  dbPath: './wallet.db',
+  network: 'testnet'
+});
+
+console.log(wallet.initDatabase());
+
+const client = new LightWalletClient('lightwalletd.testnet.electriccoin.co:9067', true);
+const synchronizer = new ZcashSynchronizer(wallet, client);
+// await synchronizer.syncOnce()
 ```
 
 ## API
@@ -103,6 +135,64 @@ Returns:
 - `diversifierIndexHex`
 - `receiverTypes`
 
+### `seedFingerprint(seedHex) => string`
+
+Derives the ZIP-32 seed fingerprint for a 32..252-byte seed.
+
+### `deriveUnifiedFullViewingKey(input) => string`
+
+Derives a UFVK string from:
+
+- `seedHex`
+- `network`
+- `account`
+
+### `new ZcashWallet({ dbPath, network })`
+
+Builder-facing wallet/database wrapper.
+
+Current methods:
+
+- `initDatabase({ seedHex? })`
+- `createAccount({ seedHex, accountName, treeState, recoverUntilHeight? })`
+- `listAccounts()`
+- `getCurrentAddress(accountUuid)`
+- `getNextAvailableAddress(accountUuid)`
+- `getSaplingAddress(accountUuid)`
+- `getOrchardAddress(accountUuid)`
+- `getTransparentAddress(accountUuid)`
+- `updateChainTip(tipHeight)`
+- `suggestScanRanges()`
+- `scanCachedBlocks({ blocksHex, treeState, limit })`
+- `putSaplingSubtreeRoots(startIndex, roots)`
+- `putOrchardSubtreeRoots(startIndex, roots)`
+- `getWalletSummary()`
+- `latestHeight()`
+- `transactionDataRequests()`
+- `getAllTransparentAddresses()`
+- `putUtxo({ txidHex, index, scriptHex, value, height })`
+- `proposeTransfer({ accountUuid, toAddress, value, memo?, changeMemo?, fallbackChangePool? })`
+
+### `new LightWalletClient(host, tls?)`
+
+Minimal gRPC client for `lightwalletd`.
+
+Current methods:
+
+- `getLatestBlock()`
+- `getTreeState(height)`
+- `getLightdInfo()`
+- `getBlockRange(startHeight, endHeight)`
+- `getSubtreeRoots(protocol, startIndex?, maxEntries?)`
+
+### `new ZcashSynchronizer(wallet, client, options?)`
+
+Minimal sync engine.
+
+Current methods:
+
+- `syncOnce()`
+
 ## Current roadmap
 
 1. Address parsing and validation
@@ -110,7 +200,8 @@ Returns:
 3. Unified address generation
 4. Wallet initialization and key derivation
 5. Chain sync against `lightwalletd`
-6. Transaction proposal and send
+6. Transaction enhancement and proposal creation
+7. Transaction construction, signing, and send
 
 ## Project layout
 

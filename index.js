@@ -3,6 +3,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const process = require('node:process');
+const { LightWalletClient } = require('./sdk/lightwallet/LightWalletClient.js');
+const { ZcashSynchronizer, ScanPriority } = require('./sdk/synchronizer/ZcashSynchronizer.js');
 
 let rustStringType;
 const nativeBindingCache = new Map();
@@ -17,6 +19,14 @@ class ZcashError extends Error {
 const Zip321Error = ZcashError;
 const AddressParseError = ZcashError;
 const UnifiedAddressError = ZcashError;
+const KeyDerivationError = ZcashError;
+const WalletError = ZcashError;
+
+function rejectNullBytes(value, paramName) {
+  if (typeof value === 'string' && value.includes('\0')) {
+    throw new ZcashError(`Invalid ${paramName}: string contains null bytes`);
+  }
+}
 
 function resolveLibraryPath(explicitPath) {
   if (explicitPath) {
@@ -74,6 +84,27 @@ function createNativeBindings(explicitPath) {
     parse: lib.func('RustString zcash_zip321_parse(const char *uri)'),
     parseAddress: lib.func('RustString zcash_address_parse(const char *address)'),
     generateUnifiedAddress: lib.func('RustString zcash_unified_address_generate(const char *input_json)'),
+    seedFingerprint: lib.func('RustString zcash_seed_fingerprint(const char *seed_hex)'),
+    deriveUnifiedFullViewingKey: lib.func('RustString zcash_unified_full_viewing_key_derive(const char *input_json)'),
+    walletInitDatabase: lib.func('RustString zcash_wallet_init_database(const char *input_json)'),
+    walletCreateAccount: lib.func('RustString zcash_wallet_create_account(const char *input_json)'),
+    walletListAccounts: lib.func('RustString zcash_wallet_list_accounts(const char *input_json)'),
+    walletGetCurrentAddress: lib.func('RustString zcash_wallet_get_current_address(const char *input_json)'),
+    walletGetNextAvailableAddress: lib.func('RustString zcash_wallet_get_next_available_address(const char *input_json)'),
+    walletGetSaplingAddress: lib.func('RustString zcash_wallet_get_sapling_address(const char *input_json)'),
+    walletGetOrchardAddress: lib.func('RustString zcash_wallet_get_orchard_address(const char *input_json)'),
+    walletGetTransparentAddress: lib.func('RustString zcash_wallet_get_transparent_address(const char *input_json)'),
+    walletUpdateChainTip: lib.func('RustString zcash_wallet_update_chain_tip(const char *input_json)'),
+    walletSuggestScanRanges: lib.func('RustString zcash_wallet_suggest_scan_ranges(const char *input_json)'),
+    walletScanCachedBlocks: lib.func('RustString zcash_wallet_scan_cached_blocks(const char *input_json)'),
+    walletPutSaplingSubtreeRoots: lib.func('RustString zcash_wallet_put_sapling_subtree_roots(const char *input_json)'),
+    walletPutOrchardSubtreeRoots: lib.func('RustString zcash_wallet_put_orchard_subtree_roots(const char *input_json)'),
+    walletGetSummary: lib.func('RustString zcash_wallet_get_summary(const char *input_json)'),
+    walletLatestHeight: lib.func('RustString zcash_wallet_latest_height(const char *input_json)'),
+    walletTransactionDataRequests: lib.func('RustString zcash_wallet_transaction_data_requests(const char *input_json)'),
+    walletGetAllTransparentAddresses: lib.func('RustString zcash_wallet_get_all_transparent_addresses(const char *input_json)'),
+    walletPutUtxo: lib.func('RustString zcash_wallet_put_utxo(const char *input_json)'),
+    walletProposeTransfer: lib.func('RustString zcash_wallet_propose_transfer(const char *input_json)'),
     lastError: lib.func('RustString zcash_zip321_last_error(void)')
   };
 
@@ -98,6 +129,7 @@ function normalizeRequest(payload) {
 }
 
 function parseZip321(uri, options = {}) {
+  rejectNullBytes(uri, 'uri');
   const native = options.native || createNativeBindings(options.libraryPath);
   const response = native.parse(uri);
 
@@ -120,6 +152,7 @@ function normalizeParsedAddress(payload) {
 }
 
 function parseAddress(address, options = {}) {
+  rejectNullBytes(address, 'address');
   const native = options.native || createNativeBindings(options.libraryPath);
   const response = native.parseAddress(address);
 
@@ -143,6 +176,9 @@ function normalizeGeneratedUnifiedAddress(payload) {
 }
 
 function generateUnifiedAddress(input, options = {}) {
+  rejectNullBytes(input.seedHex, 'seedHex');
+  if (input.network != null) rejectNullBytes(input.network, 'network');
+  if (input.receivers != null) rejectNullBytes(input.receivers, 'receivers');
   const native = options.native || createNativeBindings(options.libraryPath);
   const normalizedInput = {
     seed_hex: input.seedHex,
@@ -160,14 +196,270 @@ function generateUnifiedAddress(input, options = {}) {
   return normalizeGeneratedUnifiedAddress(JSON.parse(response));
 }
 
+function seedFingerprint(seedHex, options = {}) {
+  rejectNullBytes(seedHex, 'seedHex');
+  const native = options.native || createNativeBindings(options.libraryPath);
+  const response = native.seedFingerprint(seedHex);
+
+  if (response == null) {
+    const message = native.lastError() || 'native seed fingerprint derivation failed';
+    throw new KeyDerivationError(message);
+  }
+
+  return response;
+}
+
+function deriveUnifiedFullViewingKey(input, options = {}) {
+  rejectNullBytes(input.seedHex, 'seedHex');
+  if (input.network != null) rejectNullBytes(input.network, 'network');
+  const native = options.native || createNativeBindings(options.libraryPath);
+  const normalizedInput = {
+    seed_hex: input.seedHex,
+    network: input.network,
+    account: input.account
+  };
+  const response = native.deriveUnifiedFullViewingKey(JSON.stringify(normalizedInput));
+
+  if (response == null) {
+    const message = native.lastError() || 'native UFVK derivation failed';
+    throw new KeyDerivationError(message);
+  }
+
+  return response;
+}
+
+class ZcashWallet {
+  constructor({ dbPath, network = 'mainnet' }, options = {}) {
+    rejectNullBytes(dbPath, 'dbPath');
+    rejectNullBytes(network, 'network');
+    this.dbPath = dbPath;
+    this.network = network;
+    this._native = options.native || createNativeBindings(options.libraryPath);
+  }
+
+  initDatabase({ seedHex } = {}) {
+    if (seedHex != null) rejectNullBytes(seedHex, 'seedHex');
+    const response = this._native.walletInitDatabase(
+      JSON.stringify({
+        db_path: this.dbPath,
+        network: this.network,
+        seed_hex: seedHex
+      })
+    );
+    if (response == null) {
+      throw new WalletError(this._native.lastError() || 'wallet database initialization failed');
+    }
+    return JSON.parse(response).status;
+  }
+
+  createAccount({ seedHex, accountName, treeState, recoverUntilHeight }) {
+    rejectNullBytes(seedHex, 'seedHex');
+    rejectNullBytes(accountName, 'accountName');
+    const response = this._native.walletCreateAccount(
+      JSON.stringify({
+        db_path: this.dbPath,
+        network: this.network,
+        seed_hex: seedHex,
+        account_name: accountName,
+        treestate: {
+          network: treeState.network,
+          height: treeState.height,
+          hash: treeState.hash,
+          time: treeState.time,
+          sapling_tree: treeState.saplingTree,
+          orchard_tree: treeState.orchardTree
+        },
+        recover_until_height: recoverUntilHeight
+      })
+    );
+    if (response == null) {
+      throw new WalletError(this._native.lastError() || 'wallet account creation failed');
+    }
+    return JSON.parse(response).account_uuid;
+  }
+
+  listAccounts() {
+    const response = this._native.walletListAccounts(
+      JSON.stringify({
+        db_path: this.dbPath,
+        network: this.network
+      })
+    );
+    if (response == null) {
+      throw new WalletError(this._native.lastError() || 'wallet account listing failed');
+    }
+    return JSON.parse(response);
+  }
+
+  getCurrentAddress(accountUuid) {
+    return this._walletStringCall('walletGetCurrentAddress', accountUuid);
+  }
+
+  getNextAvailableAddress(accountUuid) {
+    return this._walletStringCall('walletGetNextAvailableAddress', accountUuid);
+  }
+
+  getSaplingAddress(accountUuid) {
+    return this._walletStringCall('walletGetSaplingAddress', accountUuid);
+  }
+
+  getOrchardAddress(accountUuid) {
+    return this._walletStringCall('walletGetOrchardAddress', accountUuid);
+  }
+
+  getTransparentAddress(accountUuid) {
+    return this._walletStringCall('walletGetTransparentAddress', accountUuid);
+  }
+
+  updateChainTip(tipHeight) {
+    this._walletJsonCall('walletUpdateChainTip', {
+      db_path: this.dbPath,
+      network: this.network,
+      tip_height: tipHeight
+    });
+  }
+
+  suggestScanRanges() {
+    return this._walletJsonCall('walletSuggestScanRanges', {
+      db_path: this.dbPath,
+      network: this.network
+    });
+  }
+
+  scanCachedBlocks({ blocksHex, treeState, limit }) {
+    return this._walletJsonCall('walletScanCachedBlocks', {
+      db_path: this.dbPath,
+      network: this.network,
+      blocks_hex: blocksHex,
+      treestate: {
+        network: treeState.network,
+        height: treeState.height,
+        hash: treeState.hash,
+        time: treeState.time,
+        sapling_tree: treeState.saplingTree,
+        orchard_tree: treeState.orchardTree
+      },
+      limit
+    });
+  }
+
+  putSaplingSubtreeRoots(startIndex, roots) {
+    this._walletJsonCall('walletPutSaplingSubtreeRoots', {
+      db_path: this.dbPath,
+      network: this.network,
+      start_index: startIndex,
+      roots: roots.map(root => ({
+        root_hash_hex: root.rootHashHex,
+        completing_block_height: root.completingBlockHeight
+      }))
+    });
+  }
+
+  putOrchardSubtreeRoots(startIndex, roots) {
+    this._walletJsonCall('walletPutOrchardSubtreeRoots', {
+      db_path: this.dbPath,
+      network: this.network,
+      start_index: startIndex,
+      roots: roots.map(root => ({
+        root_hash_hex: root.rootHashHex,
+        completing_block_height: root.completingBlockHeight
+      }))
+    });
+  }
+
+  getWalletSummary() {
+    return this._walletJsonCall('walletGetSummary', {
+      db_path: this.dbPath,
+      network: this.network
+    });
+  }
+
+  latestHeight() {
+    return this._walletJsonCall('walletLatestHeight', {
+      db_path: this.dbPath,
+      network: this.network
+    });
+  }
+
+  transactionDataRequests() {
+    return this._walletJsonCall('walletTransactionDataRequests', {
+      db_path: this.dbPath,
+      network: this.network
+    });
+  }
+
+  getAllTransparentAddresses() {
+    return this._walletJsonCall('walletGetAllTransparentAddresses', {
+      db_path: this.dbPath,
+      network: this.network
+    });
+  }
+
+  putUtxo({ txidHex, index, scriptHex, value, height }) {
+    this._walletJsonCall('walletPutUtxo', {
+      db_path: this.dbPath,
+      network: this.network,
+      txid_hex: txidHex,
+      index,
+      script_hex: scriptHex,
+      value,
+      height
+    });
+  }
+
+  proposeTransfer({ accountUuid, toAddress, value, memo, changeMemo, fallbackChangePool }) {
+    return this._walletJsonCall('walletProposeTransfer', {
+      db_path: this.dbPath,
+      network: this.network,
+      account_uuid: accountUuid,
+      to_address: toAddress,
+      value,
+      memo,
+      change_memo: changeMemo,
+      fallback_change_pool: fallbackChangePool
+    });
+  }
+
+  _walletStringCall(methodName, accountUuid) {
+    rejectNullBytes(accountUuid, 'accountUuid');
+    const response = this._native[methodName](
+      JSON.stringify({
+        db_path: this.dbPath,
+        network: this.network,
+        account_uuid: accountUuid
+      })
+    );
+    if (response == null) {
+      throw new WalletError(this._native.lastError() || `${methodName} failed`);
+    }
+    return response;
+  }
+
+  _walletJsonCall(methodName, payload) {
+    const response = this._native[methodName](JSON.stringify(payload));
+    if (response == null) {
+      throw new WalletError(this._native.lastError() || `${methodName} failed`);
+    }
+    return JSON.parse(response);
+  }
+}
+
 module.exports = {
   AddressParseError,
+  LightWalletClient,
+  KeyDerivationError,
+  ScanPriority,
   UnifiedAddressError,
+  WalletError,
   ZcashError,
+  ZcashWallet,
+  ZcashSynchronizer,
   Zip321Error,
   createNativeBindings,
+  deriveUnifiedFullViewingKey,
   generateUnifiedAddress,
   parseAddress,
   parseZip321,
+  seedFingerprint,
   resolveLibraryPath
 };
