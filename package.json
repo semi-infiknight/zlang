@@ -1,0 +1,43 @@
+{
+  "name": "zcash-zip321-alpha",
+  "version": "0.1.0-alpha.0",
+  "description": "Alpha JavaScript bindings for Zcash ZIP-321 parsing via Rust FFI.",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "commonjs",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "Cargo.toml",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "install": "cargo build --release",
+    "build:native": "cargo build --release",
+    "test": "node --test",
+    "prepublishOnly": "npm test && npm run build:native"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/semi/zcash-zip321-alpha.git"
+  },
+  "keywords": [
+    "zcash",
+    "zip321",
+    "ffi",
+    "wallet",
+    "rust"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "koffi": "^2.11.0"
+  }
+}
